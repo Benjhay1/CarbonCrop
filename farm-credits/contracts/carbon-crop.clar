@@ -41,106 +41,99 @@
     verification-count: uint })
 
 ;; Administrative Functions
-
 (define-public (register-inspector (inspector-principal principal))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (ok (var-set inspector-registry 
-        (append (var-get inspector-registry) inspector-principal)))))
-
+    (asserts! (not (is-eq inspector-principal CONTRACT_OWNER)) ERR_NOT_AUTHORIZED)  ;; Prevent owner from being inspector
+    (let ((new-registry (unwrap! (as-max-len? (append (var-get inspector-registry) inspector-principal) u50) ERR_NOT_AUTHORIZED)))
+      (ok (var-set inspector-registry new-registry)))))
+   
 ;; Farm Verification Functions
-
 (define-public (submit-verification
     (farm-id uint)
+    (farm-owner principal)
     (carbon-score uint)
     (water-score uint)
     (chemical-reduction uint))
-  (let 
-    ((farm-owner (get owner (unwrap! (map-get? farm-data {farm-id: farm-id}) ERR_NOT_FOUND)))
-     (previous-data (default-to 
-        { carbon-score: u0, water-score: u0, chemical-reduction: u0, last-verified: u0, total-rewards: u0 }
-        (map-get? farm-data {farm-id: farm-id}))))
-    (asserts! (is-some (index-of (var-get inspector-registry) tx-sender)) ERR_NOT_AUTHORIZED)
-    (asserts! (> block-height (+ (get last-verified previous-data) MIN_VERIFICATION_PERIOD)) ERR_NOT_AUTHORIZED)
-    
-    ;; Calculate rewards based on improvements
+  (begin
+    ;; Add input validation
+    (asserts! (> farm-id u0) ERR_INVALID_AMOUNT)  ;; Ensure valid farm ID
+    (asserts! (not (is-eq farm-owner CONTRACT_OWNER)) ERR_NOT_AUTHORIZED)  ;; Prevent owner manipulation
+    (asserts! (<= carbon-score u10000) ERR_INVALID_AMOUNT)  ;; Set reasonable limits
+    (asserts! (<= water-score u10000) ERR_INVALID_AMOUNT)
+    (asserts! (<= chemical-reduction u10000) ERR_INVALID_AMOUNT)
+
     (let 
-      ((carbon-improvement (- carbon-score (get carbon-score previous-data)))
-       (water-improvement (- water-score (get water-score previous-data)))
-       (chemical-improvement (- chemical-reduction (get chemical-reduction previous-data)))
-       (total-improvement (+ carbon-improvement water-improvement chemical-improvement))
-       (reward-amount (* total-improvement u1000000))) ;; Scale by token precision
+      ((previous-data (default-to 
+          { carbon-score: u0, water-score: u0, chemical-reduction: u0, last-verified: u0, total-rewards: u0 }
+          (map-get? farm-data {farm-id: farm-id, owner: farm-owner}))))
+      (asserts! (is-some (index-of (var-get inspector-registry) tx-sender)) ERR_NOT_AUTHORIZED)
+      (asserts! (> block-height (+ (get last-verified previous-data) MIN_VERIFICATION_PERIOD)) ERR_NOT_AUTHORIZED)
       
-      ;; Mint tokens as reward
-      (try! (mint-tokens farm-owner reward-amount))
-      
-      ;; Update farm data
-      (ok (map-set farm-data
-        {farm-id: farm-id, owner: farm-owner}
-        { carbon-score: carbon-score,
-          water-score: water-score,
-          chemical-reduction: chemical-reduction,
-          last-verified: block-height,
-          total-rewards: (+ (get total-rewards previous-data) reward-amount) })))))
+      (let 
+        ((carbon-improvement (- carbon-score (get carbon-score previous-data)))
+         (water-improvement (- water-score (get water-score previous-data)))
+         (chemical-improvement (- chemical-reduction (get chemical-reduction previous-data)))
+         (total-improvement (+ carbon-improvement water-improvement chemical-improvement))
+         (reward-amount (* total-improvement u1000000)))
+
+        ;; Validate improvements and reward
+        (asserts! (>= carbon-improvement u0) ERR_INVALID_AMOUNT)
+        (asserts! (>= water-improvement u0) ERR_INVALID_AMOUNT)
+        (asserts! (>= chemical-improvement u0) ERR_INVALID_AMOUNT)
+        (asserts! (> reward-amount u0) ERR_INVALID_AMOUNT)
+        
+        (unwrap-panic (mint-tokens farm-owner reward-amount))
+        
+        (ok (map-set farm-data
+          {farm-id: farm-id, owner: farm-owner}
+          { carbon-score: carbon-score,
+            water-score: water-score,
+            chemical-reduction: chemical-reduction,
+            last-verified: block-height,
+            total-rewards: (+ (get total-rewards previous-data) reward-amount) }))))))
 
 ;; Token Functions
-
 (define-private (mint-tokens (recipient principal) (amount uint))
   (begin
     (var-set total-supply (+ (var-get total-supply) amount))
-    (ok (map-set token-balances 
+    (map-set token-balances 
         recipient
-        (+ (default-to u0 (map-get? token-balances recipient)) amount)))))
+        (+ (default-to u0 (map-get? token-balances recipient)) amount))
+    (ok amount)))  ;; Return the minted amount for better error tracking
 
 (define-public (transfer (recipient principal) (amount uint))
-  (let ((sender-balance (default-to u0 (map-get? token-balances tx-sender))))
-    (asserts! (>= sender-balance amount) ERR_INSUFFICIENT_BALANCE)
-    (map-set token-balances
-      tx-sender
-      (- sender-balance amount))
-    (map-set token-balances
-      recipient
-      (+ (default-to u0 (map-get? token-balances recipient)) amount))
-    (ok true)))
+  (begin
+    (asserts! (not (is-eq recipient tx-sender)) ERR_NOT_AUTHORIZED)  ;; Prevent self-transfer
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)  ;; Ensure positive amount
+    (let ((sender-balance (default-to u0 (map-get? token-balances tx-sender))))
+      (asserts! (>= sender-balance amount) ERR_INSUFFICIENT_BALANCE)
+      (map-set token-balances
+        tx-sender
+        (- sender-balance amount))
+      (map-set token-balances
+        recipient
+        (+ (default-to u0 (map-get? token-balances recipient)) amount))
+      (ok true))))
 
 ;; Marketplace Functions
-
 (define-public (create-listing (listing-id uint) (amount uint) (price-per-token uint))
-  (let ((seller-balance (default-to u0 (map-get? token-balances tx-sender))))
-    (asserts! (>= seller-balance amount) ERR_INSUFFICIENT_BALANCE)
-    (asserts! (is-none (map-get? market-listings listing-id)) ERR_ALREADY_LISTED)
-    
-    ;; Lock tokens in contract
-    (try! (transfer CONTRACT_OWNER amount))
-    
-    (ok (map-set market-listings
-      listing-id
-      { seller: tx-sender,
-        amount: amount,
-        price-per-token: price-per-token,
-        active: true }))))
-
-(define-public (purchase-listing (listing-id uint) (amount uint))
-  (let ((listing (unwrap! (map-get? market-listings listing-id) ERR_NOT_FOUND)))
-    (asserts! (get active listing) ERR_NOT_FOUND)
-    (asserts! (<= amount (get amount listing)) ERR_INVALID_AMOUNT)
-    
-    (let ((total-cost (* amount (get price-per-token listing))))
-      ;; Transfer tokens to buyer
-      (try! (transfer tx-sender amount))
+  (begin
+    (asserts! (> listing-id u0) ERR_INVALID_AMOUNT)  ;; Ensure valid listing ID
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)  ;; Ensure positive amount
+    (asserts! (> price-per-token u0) ERR_INVALID_AMOUNT)  ;; Ensure positive price
+    (let ((seller-balance (default-to u0 (map-get? token-balances tx-sender))))
+      (asserts! (>= seller-balance amount) ERR_INSUFFICIENT_BALANCE)
+      (asserts! (is-none (map-get? market-listings listing-id)) ERR_ALREADY_LISTED)
       
-      ;; Update listing
-      (map-set market-listings
+      (try! (transfer CONTRACT_OWNER amount))
+      
+      (ok (map-set market-listings
         listing-id
-        (merge listing 
-          { amount: (- (get amount listing) amount),
-            active: (> (- (get amount listing) amount) u0) }))
-      
-      ;; Update reputation scores
-      (update-reputation (get seller listing))
-      (update-reputation tx-sender)
-      
-      (ok true))))
+        { seller: tx-sender,
+          amount: amount,
+          price-per-token: price-per-token,
+          active: true })))))
 
 ;; Reputation Functions
 
@@ -158,8 +151,8 @@
 (define-read-only (get-balance (user principal))
   (ok (default-to u0 (map-get? token-balances user))))
 
-(define-read-only (get-farm-data (farm-id uint))
-  (map-get? farm-data {farm-id: farm-id}))
+(define-read-only (get-farm-data (farm-id uint) (owner principal))
+  (map-get? farm-data {farm-id: farm-id, owner: owner}))
 
 (define-read-only (get-listing (listing-id uint))
   (map-get? market-listings listing-id))
